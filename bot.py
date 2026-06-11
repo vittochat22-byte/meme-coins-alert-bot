@@ -27,39 +27,59 @@ log = logging.getLogger("meme-bot")
 @dataclass
 class Config:
     # --- Sicurezza (hard filters) ---
-    max_top10_holders_pct: float = 20.0      # % max dei top 10 holders
-    max_dev_wallet_pct: float = 5.0          # % max del dev wallet
-    require_mint_revoked: bool = True        # mint authority revocata
+    # Alzato: i top 10 holder spesso superano il 20% nei token nuovi legittimi
+    max_top10_holders_pct: float = 40.0      # % max dei top 10 holders
+    # Alzato: alcuni dev tengono fino al 10% legittimamente
+    max_dev_wallet_pct: float = 10.0         # % max del dev wallet
+    # Disabilitato: molti token nuovi non hanno ancora revocato il mint
+    require_mint_revoked: bool = False       # mint authority revocata
+    # Mantenuto: freeze authority è un rischio reale (può congelare i wallet)
     require_freeze_revoked: bool = True      # freeze authority revocata
-    require_lp_locked: bool = True           # liquidity locked
+    # Disabilitato: la LP locked è rara nei primissimi minuti/ore
+    require_lp_locked: bool = False          # liquidity locked
+    # Mantenuto: honeypot check è il filtro di sicurezza più importante
     check_honeypot: bool = True              # simula buy/sell
 
     # --- Qualità ---
-    min_liquidity_usd: float = 10_000
-    max_liquidity_usd: float = 500_000
-    min_mcap_usd: float = 50_000
-    max_mcap_usd: float = 500_000
-    min_age_minutes: int = 30
-    max_age_minutes: int = 360               # 6 ore
-    min_holders: int = 50
+    # Abbassato: token nuovi partono spesso con liquidità più bassa
+    min_liquidity_usd: float = 5_000
+    # Alzato: non limitare token che stanno crescendo bene
+    max_liquidity_usd: float = 1_000_000
+    # Abbassato: mcap basso è normale per token nuovi
+    min_mcap_usd: float = 20_000
+    # Alzato: più spazio per token in crescita
+    max_mcap_usd: float = 2_000_000
+    # Abbassato: catturiamo token più freschi
+    min_age_minutes: int = 15
+    # Alzato: includiamo token fino a 12 ore
+    max_age_minutes: int = 720
+    # Abbassato: 20 holders in poche ore è già un segnale positivo
+    min_holders: int = 20
 
     # --- Momentum ---
-    min_volume_5m_usd: float = 5_000
-    min_tx_5m: int = 20
-    min_buy_sell_ratio: float = 1.5
-    min_price_change_5m_pct: float = 5.0
-    max_price_change_5m_pct: float = 30.0
+    # Abbassato: anche volumi più contenuti possono indicare interesse reale
+    min_volume_5m_usd: float = 2_000
+    # Abbassato: meno tx richieste per i token più nuovi
+    min_tx_5m: int = 10
+    # Abbassato: ratio 1.2x è già bullish
+    min_buy_sell_ratio: float = 1.2
+    # Abbassato: anche movimenti più contenuti sono validi
+    min_price_change_5m_pct: float = 2.0
+    # Alzato: lasciamo spazio a pump più forti prima di escluderli
+    max_price_change_5m_pct: float = 50.0
 
     # --- Scoring (pesi) ---
-    weight_security: int = 40
+    # Ridotto il peso sicurezza per compensare i filtri hard allentati
+    weight_security: int = 35
     weight_liquidity: int = 15
-    weight_vol_mcap: int = 15
-    weight_buy_sell: int = 15
-    weight_social: int = 15
-    min_score_to_alert: int = 70
+    weight_vol_mcap: int = 20
+    weight_buy_sell: int = 20
+    weight_social: int = 10
+    # Abbassato leggermente: con filtri più larghi il punteggio medio scende
+    min_score_to_alert: int = 60
 
     # --- Runtime ---
-    scan_interval_seconds: int = 60
+    scan_interval_seconds: int = 40
     alert_cooldown_seconds: int = 3600       # non ri-alertare lo stesso token per 1h
 
     # --- API Keys ---
@@ -543,7 +563,7 @@ class MemeCoinBot:
         # Controllo filtri di qualità
         ok, reason = passes_quality_filters(token, self.cfg)
         if not ok:
-            log.debug(f"Skip {token.symbol}: {reason}")
+            log.info(f"⛔ Skip {token.symbol}: {reason}")
             self._stats["blocked"] += 1
             return
 
