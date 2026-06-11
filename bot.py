@@ -324,6 +324,57 @@ class DexScreenerSource:
             return None
 
 
+
+class PumpFunSource:
+    """Recupera i token appena graduati da Pump.fun su Raydium.
+    Endpoint pubblico, nessuna API key necessaria.
+    I token "graduated" hanno già superato i $69k di mcap sulla bonding curve
+    e sono ora tradati su Raydium — sono i più interessanti da monitorare.
+    """
+    GRADUATES_URL = "https://frontend-api.pump.fun/coins/for-you?offset=0&limit=50&includeNsfw=false"
+    GRADUATION_URL = "https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=false&graduated=true"
+
+    async def get_graduated_tokens(self, session: aiohttp.ClientSession) -> list[str]:
+        """Restituisce una lista di indirizzi di token appena graduati su Raydium."""
+        addresses = []
+        for url in [self.GRADUATION_URL, self.GRADUATES_URL]:
+            try:
+                headers = {"User-Agent": "Mozilla/5.0 (compatible; meme-bot/1.0)"}
+                async with session.get(url, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status != 200:
+                        log.debug(f"PumpFun {url} status {r.status}")
+                        continue
+                    data = await r.json()
+                    if not isinstance(data, list):
+                        continue
+                    now_ms = int(time.time() * 1000)
+                    for coin in data:
+                        mint = coin.get("mint")
+                        if not mint:
+                            continue
+                        # Considera solo token con raydium_pool (già graduati)
+                        if not coin.get("raydium_pool"):
+                            continue
+                        # Considera solo token creati nelle ultime max_age_minutes
+                        created_ts = coin.get("created_timestamp")
+                        if created_ts:
+                            age_ms = now_ms - created_ts
+                            if age_ms > 720 * 60 * 1000:  # più di 12 ore
+                                continue
+                        addresses.append(mint)
+            except Exception as e:
+                log.debug(f"PumpFun fetch error ({url}): {e}")
+        # Deduplicazione
+        seen = set()
+        unique = []
+        for a in addresses:
+            if a not in seen:
+                seen.add(a)
+                unique.append(a)
+        log.info(f"🎮 PumpFun: trovati {len(unique)} token graduati")
+        return unique
+
 class RugcheckSource:
     """Fonte dati di sicurezza via Rugcheck (https://rugcheck.xyz).
     Endpoint pubblico, nessuna API key necessaria.
@@ -545,6 +596,7 @@ class MemeCoinBot:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.dex = DexScreenerSource()
+        self.pumpfun = PumpFunSource()
         self.rugcheck = RugcheckSource()
         self.social = SocialSource()
         self.dispatcher = AlertDispatcher(cfg)
@@ -593,11 +645,45 @@ class MemeCoinBot:
 
     async def scan_once(self, session: aiohttp.ClientSession):
         log.info("🔍 Avvio scansione nuovi token Solana...")
-        pairs = await self.dex.get_new_pairs(session)
+
+        # Fetch in parallelo da DexScreener e PumpFun
+        dex_pairs_task = self.dex.get_new_pairs(session)
+        pump_addrs_task = self.pumpfun.get_graduated_tokens(session)
+        dex_pairs, pump_addresses = await asyncio.gather(dex_pairs_task, pump_addrs_task)
+
+        # Per i token PumpFun recupera i dati pair da DexScreener
+        pump_sem = asyncio.Semaphore(5)
+        async def fetch_pump_pair(address: str) -> list[dict]:
+            async with pump_sem:
+                url = f"https://api.dexscreener.com/token-pairs/v1/solana/{address}"
+                try:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        if r.content_type != "application/json":
+                            return []
+                        data = await r.json()
+                        return data if isinstance(data, list) else []
+                except Exception as e:
+                    log.debug(f"DexScreener pump pair error ({address}): {e}")
+                    return []
+
+        pump_results = await asyncio.gather(*[fetch_pump_pair(a) for a in pump_addresses])
+        pump_pairs = [pair for pairs in pump_results for pair in pairs]
+
+        # Unisci le due fonti e deduplicazione per pairAddress
+        all_pairs_raw = dex_pairs + pump_pairs
+        seen_addr = set()
+        all_pairs = []
+        for p in all_pairs_raw:
+            pa = p.get("pairAddress", "")
+            if pa and pa not in seen_addr:
+                seen_addr.add(pa)
+                all_pairs.append(p)
+
+        log.info(f"📡 Totale pair uniche: {len(all_pairs)} (DexScreener={len(dex_pairs)} PumpFun={len(pump_pairs)})")
 
         # Filtra solo quelli nell'intervallo di età
         fresh = [
-            p for p in pairs
+            p for p in all_pairs
             if p.get("pairCreatedAt") and
             self.cfg.min_age_minutes * 60 * 1000
             <= (int(time.time() * 1000) - p["pairCreatedAt"])
@@ -649,6 +735,7 @@ class MemeCoinBot:
 
         connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
         async with aiohttp.ClientSession(connector=connector) as session:
+            await self._send_startup_message(session)
             while True:
                 try:
                     await self.scan_once(session)
@@ -656,6 +743,26 @@ class MemeCoinBot:
                     log.error(f"Errore nel ciclo principale: {e}", exc_info=True)
                 log.info(f"⏳ Prossima scansione tra {self.cfg.scan_interval_seconds}s")
                 await asyncio.sleep(self.cfg.scan_interval_seconds)
+
+    async def _send_startup_message(self, session: aiohttp.ClientSession):
+        if not self.cfg.telegram_bot_token or not self.cfg.telegram_chat_id:
+            log.warning("⚠️  Telegram non configurato: imposta TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID")
+            return
+        now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        msg = (
+            f"🚀 <b>Meme Coin Alert Bot avviato</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 Ora: {now}\n"
+            f"⏱ Scansione ogni: {self.cfg.scan_interval_seconds}s\n"
+            f"🎯 Score minimo alert: {self.cfg.min_score_to_alert}/100\n"
+            f"💧 Liquidità: ${self.cfg.min_liquidity_usd:,.0f} – ${self.cfg.max_liquidity_usd:,.0f}\n"
+            f"📊 MCap: ${self.cfg.min_mcap_usd:,.0f} – ${self.cfg.max_mcap_usd:,.0f}\n"
+            f"⏳ Età token: {self.cfg.min_age_minutes} – {self.cfg.max_age_minutes} min\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Connessione Telegram OK — in attesa di segnali..."
+        )
+        await self.dispatcher.send_telegram(session, msg)
+        log.info("📬 Messaggio di avvio inviato su Telegram")
 
 
 # ─────────────────────────────────────────────
