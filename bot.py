@@ -549,6 +549,10 @@ class MemeCoinBot:
         self.social = SocialSource()
         self.dispatcher = AlertDispatcher(cfg)
         self._stats = {"scanned": 0, "passed": 0, "alerted": 0, "blocked": 0}
+        # Tiene traccia dei pair_address già processati per non ripeterli.
+        # Si svuota automaticamente ogni 2 ore per non crescere all'infinito.
+        self._seen_pairs: dict[str, float] = {}   # pair_address -> timestamp prima visione
+        self._seen_ttl: int = 7200                # 2 ore in secondi
 
     async def process_token(self, session: aiohttp.ClientSession, raw_pair: dict):
         token = self.dex.parse_pair(raw_pair)
@@ -600,7 +604,28 @@ class MemeCoinBot:
             <= self.cfg.max_age_minutes * 60 * 1000
         ]
 
-        log.info(f"Trovate {len(fresh)} coppie nell'intervallo di età su {len(pairs)} totali")
+        # Pulizia _seen_pairs: rimuovi le entry più vecchie del TTL
+        now = time.time()
+        self._seen_pairs = {
+            addr: ts for addr, ts in self._seen_pairs.items()
+            if now - ts < self._seen_ttl
+        }
+
+        # Filtra i pair già visti in questo ciclo di vita
+        new_pairs = [
+            p for p in fresh
+            if p.get("pairAddress") and p["pairAddress"] not in self._seen_pairs
+        ]
+
+        # Registra i nuovi come visti
+        for p in new_pairs:
+            self._seen_pairs[p["pairAddress"]] = now
+
+        skipped = len(fresh) - len(new_pairs)
+        log.info(
+            f"Trovate {len(fresh)} coppie nell'intervallo di età su {len(pairs)} totali "
+            f"| nuove={len(new_pairs)} già viste={skipped}"
+        )
 
         # Processa in concorrenza (max 5 per non sovraccaricare le API)
         semaphore = asyncio.Semaphore(5)
@@ -608,7 +633,7 @@ class MemeCoinBot:
             async with semaphore:
                 await self.process_token(session, pair)
 
-        await asyncio.gather(*[bounded(p) for p in fresh])
+        await asyncio.gather(*[bounded(p) for p in new_pairs])
 
         log.info(
             f"📊 Stats: scansionati={self._stats['scanned']} "
