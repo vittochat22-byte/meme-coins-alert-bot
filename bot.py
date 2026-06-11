@@ -1,6 +1,6 @@
 """
 Meme Coin Alert Bot
-Fonti: DexScreener, Birdeye, Reddit, Nitter/X
+Fonti: DexScreener, Rugcheck, Reddit, Nitter/X
 """
 
 import asyncio
@@ -62,8 +62,8 @@ class Config:
     scan_interval_seconds: int = 60
     alert_cooldown_seconds: int = 3600       # non ri-alertare lo stesso token per 1h
 
-    # --- API Keys (opzionale per Birdeye) ---
-    birdeye_api_key: str = ""
+    # --- API Keys ---
+    # Rugcheck non richiede API key (endpoint pubblico)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
 
@@ -204,26 +204,64 @@ def passes_quality_filters(token: TokenData, cfg: Config) -> tuple[bool, str]:
 # ─────────────────────────────────────────────
 
 class DexScreenerSource:
-    BASE = "https://api.dexscreener.com/latest/dex"
+    BASE = "https://api.dexscreener.com"
 
     async def get_new_pairs(self, session: aiohttp.ClientSession) -> list[dict]:
-        """Recupera le nuove coppie Solana create nelle ultime ore."""
-        url = f"{self.BASE}/pairs/solana"
+        """Recupera le pair dei token Solana profilati di recente.
+
+        L'endpoint /latest/dex/pairs/solana (senza pairId) non esiste:
+        usiamo /token-profiles/latest/v1 per scoprire nuovi token, poi
+        /token-pairs/v1/solana/{address} per ottenere le relative pair.
+        """
+        profiles_url = f"{self.BASE}/token-profiles/latest/v1"
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
-                return data.get("pairs", [])
+            async with session.get(profiles_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.content_type != "application/json":
+                    log.warning(f"DexScreener error: unexpected mimetype {r.content_type}, status {r.status}")
+                    return []
+                profiles = await r.json()
         except Exception as e:
-            log.warning(f"DexScreener error: {e}")
+            log.warning(f"DexScreener profiles error: {e}")
             return []
 
+        if not isinstance(profiles, list):
+            return []
+
+        # Filtra solo i profili Solana
+        solana_addresses = [
+            p["tokenAddress"] for p in profiles
+            if p.get("chainId") == "solana" and p.get("tokenAddress")
+        ]
+
+        # Recupera le pair per ogni token (in concorrenza limitata)
+        semaphore = asyncio.Semaphore(10)
+
+        async def fetch_pairs(address: str) -> list[dict]:
+            async with semaphore:
+                pairs_url = f"{self.BASE}/token-pairs/v1/solana/{address}"
+                try:
+                    async with session.get(pairs_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                        if r.content_type != "application/json":
+                            return []
+                        data = await r.json()
+                        return data if isinstance(data, list) else []
+                except Exception as e:
+                    log.debug(f"DexScreener pairs error ({address}): {e}")
+                    return []
+
+        results = await asyncio.gather(*[fetch_pairs(a) for a in solana_addresses])
+        all_pairs = [pair for pairs in results for pair in pairs]
+        return all_pairs
+
     async def get_token(self, session: aiohttp.ClientSession, address: str) -> Optional[dict]:
-        url = f"{self.BASE}/tokens/{address}"
+        url = f"{self.BASE}/tokens/v1/solana/{address}"
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.content_type != "application/json":
+                    log.warning(f"DexScreener token error ({address}): unexpected mimetype {r.content_type}")
+                    return None
                 data = await r.json()
-                pairs = data.get("pairs", [])
-                return pairs[0] if pairs else None
+                return data[0] if isinstance(data, list) and data else None
         except Exception as e:
             log.warning(f"DexScreener token error ({address}): {e}")
             return None
@@ -266,54 +304,62 @@ class DexScreenerSource:
             return None
 
 
-class BirdeyeSource:
-    BASE = "https://public-api.birdeye.so"
+class RugcheckSource:
+    """Fonte dati di sicurezza via Rugcheck (https://rugcheck.xyz).
+    Endpoint pubblico, nessuna API key necessaria.
+    Endpoint: GET https://api.rugcheck.xyz/v1/tokens/{address}/report
+    """
+    BASE = "https://api.rugcheck.xyz/v1"
 
-    def __init__(self, api_key: str = ""):
-        self.api_key = api_key
-
-    async def get_token_overview(self, session: aiohttp.ClientSession, address: str) -> Optional[dict]:
-        url = f"{self.BASE}/defi/token_overview"
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
+    async def get_report(self, session: aiohttp.ClientSession, address: str) -> Optional[dict]:
+        url = f"{self.BASE}/tokens/{address}/report"
         try:
-            async with session.get(url, params={"address": address},
-                                   headers=headers,
-                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    log.warning(f"Rugcheck error ({address}): HTTP {r.status}")
+                    return None
                 data = await r.json()
-                return data.get("data")
+                return data
         except Exception as e:
-            log.warning(f"Birdeye error ({address}): {e}")
+            log.warning(f"Rugcheck error ({address}): {e}")
             return None
 
-    async def get_top_holders(self, session: aiohttp.ClientSession, address: str) -> list[dict]:
-        url = f"{self.BASE}/defi/v3/token/holder"
-        headers = {"X-API-KEY": self.api_key} if self.api_key else {}
-        try:
-            async with session.get(url, params={"address": address, "limit": 10},
-                                   headers=headers,
-                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
-                return data.get("data", {}).get("items", [])
-        except Exception as e:
-            log.warning(f"Birdeye holders error ({address}): {e}")
-            return []
-
     async def enrich_token(self, session: aiohttp.ClientSession, token: TokenData) -> TokenData:
-        overview = await self.get_token_overview(session, token.address)
-        if overview:
-            token.holders = int(overview.get("holder", token.holders) or token.holders)
-            token.market_cap_usd = float(overview.get("mc", token.market_cap_usd) or token.market_cap_usd)
+        report = await self.get_report(session, token.address)
+        if not report:
+            return token
 
-        holders = await self.get_top_holders(session, token.address)
-        if holders:
-            total_supply = sum(h.get("uiAmount", 0) for h in holders)
-            if total_supply > 0:
-                top10_pct = sum(h.get("uiAmount", 0) for h in holders[:10]) / total_supply * 100
-                token.top10_holders_pct = min(top10_pct, 100.0)
-                # Il primo holder è spesso il dev
-                if holders:
-                    token.dev_wallet_pct = (holders[0].get("uiAmount", 0) / total_supply * 100
-                                            if total_supply > 0 else 0)
+        # Holders: Rugcheck esprime le percentuali (0-100) nel campo "pct"
+        top_holders = report.get("topHolders", [])
+        if top_holders:
+            top10_pct = sum(h.get("pct", 0) for h in top_holders[:10])
+            token.top10_holders_pct = min(float(top10_pct), 100.0)
+            token.dev_wallet_pct = float(top_holders[0].get("pct", 0))
+
+        # Contatore holders totali
+        token_meta = report.get("token", {})
+        if token_meta.get("holdersCount"):
+            token.holders = int(token_meta["holdersCount"])
+
+        # Mint / Freeze authority: None = revocata
+        token.mint_revoked = not report.get("mintAuthority")
+        token.freeze_revoked = not report.get("freezeAuthority")
+
+        # LP locked: almeno un market con >= 80% LP locked
+        markets = report.get("markets", [])
+        token.lp_locked = any(
+            m.get("lp", {}).get("lpLockedPct", 0) >= 80
+            for m in markets
+        )
+
+        # Honeypot: cerca nei rischi segnalati da Rugcheck
+        risks = report.get("risks", [])
+        token.is_honeypot = any(
+            "honeypot" in r.get("name", "").lower() or
+            "honeypot" in r.get("description", "").lower()
+            for r in risks
+            if r.get("level") in ("danger", "warn")
+        )
 
         return token
 
@@ -446,7 +492,7 @@ class MemeCoinBot:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.dex = DexScreenerSource()
-        self.birdeye = BirdeyeSource(cfg.birdeye_api_key)
+        self.rugcheck = RugcheckSource()
         self.social = SocialSource()
         self.dispatcher = AlertDispatcher(cfg)
         self._stats = {"scanned": 0, "passed": 0, "alerted": 0, "blocked": 0}
@@ -458,8 +504,8 @@ class MemeCoinBot:
 
         self._stats["scanned"] += 1
 
-        # Arricchisci con dati Birdeye (holders, top10)
-        token = await self.birdeye.enrich_token(session, token)
+        # Arricchisci con dati Rugcheck (holders, mint/freeze, LP, honeypot)
+        token = await self.rugcheck.enrich_token(session, token)
 
         # Controllo filtri di qualità
         ok, reason = passes_quality_filters(token, self.cfg)
@@ -540,7 +586,6 @@ class MemeCoinBot:
 
 if __name__ == "__main__":
     cfg = Config(
-        birdeye_api_key=os.getenv("BIRDEYE_API_KEY", ""),
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         scan_interval_seconds=int(os.getenv("SCAN_INTERVAL", "60")),
