@@ -310,18 +310,51 @@ class RugcheckSource:
     Endpoint: GET https://api.rugcheck.xyz/v1/tokens/{address}/report
     """
     BASE = "https://api.rugcheck.xyz/v1"
+    _cache: dict = {}                        # address -> report (TTL-less, session)
+    _semaphore: Optional[asyncio.Semaphore] = None   # max 2 chiamate concorrenti
+    _MIN_INTERVAL = 0.6                      # secondi minimi tra chiamate successive
+    _last_call: float = 0.0
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            RugcheckSource._semaphore = asyncio.Semaphore(2)
+        return self._semaphore
 
     async def get_report(self, session: aiohttp.ClientSession, address: str) -> Optional[dict]:
+        # Cache hit
+        if address in self._cache:
+            return self._cache[address]
+
         url = f"{self.BASE}/tokens/{address}/report"
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                if r.status != 200:
-                    log.warning(f"Rugcheck error ({address}): HTTP {r.status}")
-                    return None
-                data = await r.json()
-                return data
-        except Exception as e:
-            log.warning(f"Rugcheck error ({address}): {e}")
+        max_retries = 4
+
+        async with self._get_semaphore():
+            # Rate limiting: rispetta un intervallo minimo tra chiamate
+            now = time.monotonic()
+            wait = self._MIN_INTERVAL - (now - RugcheckSource._last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+            for attempt in range(max_retries):
+                try:
+                    RugcheckSource._last_call = time.monotonic()
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                        if r.status == 429:
+                            retry_after = float(r.headers.get("Retry-After", 2 ** (attempt + 1)))
+                            log.debug(f"Rugcheck 429 ({address}), retry in {retry_after:.1f}s (attempt {attempt+1}/{max_retries})")
+                            await asyncio.sleep(retry_after)
+                            continue
+                        if r.status != 200:
+                            log.warning(f"Rugcheck error ({address}): HTTP {r.status}")
+                            return None
+                        data = await r.json()
+                        self._cache[address] = data
+                        return data
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        log.warning(f"Rugcheck error ({address}): {e}")
             return None
 
     async def enrich_token(self, session: aiohttp.ClientSession, token: TokenData) -> TokenData:
@@ -549,8 +582,8 @@ class MemeCoinBot:
 
         log.info(f"Trovate {len(fresh)} coppie nell'intervallo di età su {len(pairs)} totali")
 
-        # Processa in concorrenza (max 10 per non sovraccaricare le API)
-        semaphore = asyncio.Semaphore(10)
+        # Processa in concorrenza (max 5 per non sovraccaricare le API)
+        semaphore = asyncio.Semaphore(5)
         async def bounded(pair):
             async with semaphore:
                 await self.process_token(session, pair)
