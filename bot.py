@@ -709,7 +709,7 @@ class MemeCoinBot:
 
         skipped = len(fresh) - len(new_pairs)
         log.info(
-            f"Trovate {len(fresh)} coppie nell'intervallo di età su {len(pairs)} totali "
+            f"Trovate {len(fresh)} coppie nell'intervallo di età su {len(all_pairs)} totali "
             f"| nuove={len(new_pairs)} già viste={skipped}"
         )
 
