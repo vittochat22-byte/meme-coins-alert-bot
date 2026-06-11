@@ -226,34 +226,81 @@ def passes_quality_filters(token: TokenData, cfg: Config) -> tuple[bool, str]:
 class DexScreenerSource:
     BASE = "https://api.dexscreener.com"
 
-    async def get_new_pairs(self, session: aiohttp.ClientSession) -> list[dict]:
-        """Recupera le pair dei token Solana profilati di recente.
-
-        L'endpoint /latest/dex/pairs/solana (senza pairId) non esiste:
-        usiamo /token-profiles/latest/v1 per scoprire nuovi token, poi
-        /token-pairs/v1/solana/{address} per ottenere le relative pair.
-        """
-        profiles_url = f"{self.BASE}/token-profiles/latest/v1"
+    async def _get_addresses_from_list_endpoint(
+        self, session: aiohttp.ClientSession, url: str, label: str
+    ) -> list[str]:
+        """Chiama un endpoint che ritorna una lista e ne estrae gli indirizzi Solana."""
         try:
-            async with session.get(profiles_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.content_type != "application/json":
-                    log.warning(f"DexScreener error: unexpected mimetype {r.content_type}, status {r.status}")
+                    log.warning(f"DexScreener {label}: mimetype inatteso {r.content_type}")
                     return []
-                profiles = await r.json()
+                data = await r.json()
         except Exception as e:
-            log.warning(f"DexScreener profiles error: {e}")
+            log.warning(f"DexScreener {label} error: {e}")
             return []
-
-        if not isinstance(profiles, list):
+        if not isinstance(data, list):
             return []
-
-        # Filtra solo i profili Solana
-        solana_addresses = [
-            p["tokenAddress"] for p in profiles
+        return [
+            p["tokenAddress"] for p in data
             if p.get("chainId") == "solana" and p.get("tokenAddress")
         ]
 
-        # Recupera le pair per ogni token (in concorrenza limitata)
+    async def _get_addresses_from_search(
+        self, session: aiohttp.ClientSession, query: str
+    ) -> list[str]:
+        """Ricerca pair trending su Solana tramite /latest/dex/search."""
+        url = f"{self.BASE}/latest/dex/search"
+        try:
+            async with session.get(url, params={"q": query},
+                                   timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.content_type != "application/json":
+                    return []
+                data = await r.json()
+        except Exception as e:
+            log.warning(f"DexScreener search error ({query}): {e}")
+            return []
+        pairs = data.get("pairs", []) if isinstance(data, dict) else []
+        return [
+            p.get("baseToken", {}).get("address")
+            for p in pairs
+            if p.get("chainId") == "solana" and p.get("baseToken", {}).get("address")
+        ]
+
+    async def get_new_pairs(self, session: aiohttp.ClientSession) -> list[dict]:
+        """Recupera pair da 3 fonti DexScreener in parallelo:
+        1. /token-profiles/latest/v1  — token con profilo pubblicato
+        2. /token-boosts/latest/v1    — token con boost attivi (spesso pump in corso)
+        3. /latest/dex/search?q=solana — pair trending su Solana
+        Poi risolve gli indirizzi in pair tramite /token-pairs/v1/solana/{address}.
+        """
+        profiles_task = self._get_addresses_from_list_endpoint(
+            session, f"{self.BASE}/token-profiles/latest/v1", "profiles"
+        )
+        boosts_task = self._get_addresses_from_list_endpoint(
+            session, f"{self.BASE}/token-boosts/latest/v1", "boosts"
+        )
+        search_task = self._get_addresses_from_search(session, "solana")
+
+        profiles_addrs, boosts_addrs, search_addrs = await asyncio.gather(
+            profiles_task, boosts_task, search_task
+        )
+
+        # Deduplicazione indirizzi
+        seen = set()
+        unique_addrs = []
+        for a in profiles_addrs + boosts_addrs + search_addrs:
+            if a and a not in seen:
+                seen.add(a)
+                unique_addrs.append(a)
+
+        log.info(
+            f"📋 DexScreener: profiles={len(profiles_addrs)} "
+            f"boosts={len(boosts_addrs)} search={len(search_addrs)} "
+            f"→ unici={len(unique_addrs)}"
+        )
+
+        # Risolvi ogni indirizzo in pair (concorrenza limitata per rispettare rate limit)
         semaphore = asyncio.Semaphore(10)
 
         async def fetch_pairs(address: str) -> list[dict]:
@@ -269,8 +316,8 @@ class DexScreenerSource:
                     log.debug(f"DexScreener pairs error ({address}): {e}")
                     return []
 
-        results = await asyncio.gather(*[fetch_pairs(a) for a in solana_addresses])
-        all_pairs = [pair for pairs in results for pair in pairs]
+        results = await asyncio.gather(*[fetch_pairs(a) for a in unique_addrs])
+        all_pairs = [pair for sublist in results for pair in sublist]
         return all_pairs
 
     async def get_token(self, session: aiohttp.ClientSession, address: str) -> Optional[dict]:
